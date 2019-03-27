@@ -4,3 +4,5 @@ require (
 	github.com/cloudfoundry/libcfbuildpack v1.44.0
 	github.com/pkg/errors v0.8.1
 )
+
+replace github.com/cloudfoundry/libcfbuildpack => /Users/pivotal/workspace/libcfbuildpack
