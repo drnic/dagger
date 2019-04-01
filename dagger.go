@@ -2,7 +2,6 @@ package dagger
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,10 +12,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/cloudfoundry/libcfbuildpack/helper"
+	"github.com/cloudfoundry/dagger/utils"
+
+	"context"
+
+	"github.com/cloudfoundry/libcfbuildpack/packager/cnbpackager"
 	"github.com/pkg/errors"
 )
 
@@ -27,11 +29,8 @@ const (
 	DEFAULT_RUN_IMAGE   = "cfbuildpacks/cflinuxfs3-cnb-experimental:run"
 )
 
-var downloadCache sync.Map
-
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	downloadCache = sync.Map{}
 }
 
 func PackageBuildpack() (string, error) {
@@ -47,28 +46,57 @@ func PackageBuildpack() (string, error) {
 	return bpDir, nil
 }
 
-var letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
+func PackageLocalCachedBuildpack(bpName, bpRoot string) (string, error) {
+	tarFile := utils.CreateUniqueFilepath(bpName)
 
-func RandStringRunes(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	defer utils.ReplaceArgs(bpRoot)()
+	//defer utils.ReplaceWorkingDirectory(bpRoot)()
+	pkgr, err := cnbpackager.DefaultPackager(tarFile)
+
+	if err != nil {
+		return "", err
 	}
-	return string(b)
+	if err := pkgr.Create(true); err != nil {
+		return "", err
+	}
+	//if err := pkgr.Archive(); err != nil {
+	//	return "", err
+	//}
+
+	if err := os.RemoveAll(filepath.Join(bpRoot, "dependency-cache")); err != nil {
+		return "", err
+	}
+
+	return tarFile, err
 }
 
-func TempBuildpackPath(name string) string {
-	return filepath.Join("/tmp", name+"-"+RandStringRunes(16))
-}
+func PackageCachedBuildpack(bpName string) (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
 
-func PackageCachedBuildpack(bpPath string) (string, string, error) {
-	tarFile := TempBuildpackPath(filepath.Base(bpPath)) // + ".tgz"
-	cmd := exec.Command("./.bin/packager", tarFile)
-	cmd.Dir = bpPath
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
+	bpRoot, err := GetLatestBuildpackSource(bpName)
+	if err != nil {
+		return "", err
+	}
 
-	return tarFile, string(out), err
+	if err := os.Chdir(bpRoot); err != nil {
+		return "", err
+	}
+	defer os.Chdir(wd)
+
+	content, _ := ioutil.ReadDir(bpRoot)
+	var extractedDir string
+
+	for _, info := range content {
+		if info.IsDir() {
+			extractedDir = info.Name()
+			break
+		}
+	}
+
+	return PackageLocalCachedBuildpack(bpName, filepath.Join(bpRoot, extractedDir))
 }
 
 func PackageLocalBuildpack(name string) (string, error) {
@@ -84,61 +112,59 @@ func PackageLocalBuildpack(name string) (string, error) {
 	return bpDir, nil
 }
 
-func GetLatestBuildpack(name string) (string, error) {
-	resp, err := http.Get(fmt.Sprintf("https://api.github.com/repos/cloudfoundry/%s/releases/latest", name))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	release := struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			BrowserDownloadURL string `json:"browser_download_url"`
-		} `json:"assets"`
-	}{}
-
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return "", err
-	}
-
-	if len(release.Assets) == 0 {
-		return "", fmt.Errorf("there are no releases for %s", name)
-	}
-
-	contents, found := downloadCache.Load(name + release.TagName)
-	if !found {
-		buildpackResp, err := http.Get(release.Assets[0].BrowserDownloadURL)
-		if err != nil {
-			return "", err
-		}
-		defer buildpackResp.Body.Close()
-
-		contents, err = ioutil.ReadAll(buildpackResp.Body)
-		if err != nil {
-			return "", err
-		}
-
-		downloadCache.Store(name+release.TagName, contents)
-	}
-
-	downloadFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(downloadFile.Name())
-
-	_, err = io.Copy(downloadFile, bytes.NewReader(contents.([]byte)))
+func GetLatestBuildpackSource(name string) (string, error) {
+	releaseResp, err := GetCNBReleases(name)
 	if err != nil {
 		return "", err
 	}
 
-	dest, err := ioutil.TempDir("", "")
+	archive, err := utils.DownloadArchive(releaseResp.SourceTarball, name, releaseResp.TagName)
+	defer os.Remove(archive)
+
+	if err != nil {
+		return "", err
+	}
+	return utils.ExtractArchive(archive)
+}
+
+func GetCNBReleases(cnbName string) (utils.ReleaseResponse, error) {
+	result := utils.ReleaseResponse{}
+
+	ctx := context.Background()
+	client := utils.GetClient(ctx)
+	endpoint := GetApiEndpoint(cnbName)
+
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return result, err
+	}
+
+	_, err = client.Do(ctx, request, &result)
+	if err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func GetLatestBuildpackRelease(name string) (string, error) {
+	releaseResp, err := GetCNBReleases(name)
 	if err != nil {
 		return "", err
 	}
 
-	return dest, helper.ExtractTarGz(downloadFile.Name(), dest, 0)
+	downloadUrl, tagName, err := GetDownloadUri(releaseResp, 0)
+	if err != nil {
+		return "", err
+	}
+
+	archive, err := utils.DownloadArchive(downloadUrl, name, tagName)
+	defer os.Remove(archive)
+
+	if err != nil {
+		return "", err
+	}
+	return utils.ExtractArchive(archive)
 }
 
 // This returns the build logs as part of the error case
@@ -213,7 +239,7 @@ type HealthCheck struct {
 }
 
 func (a *App) BuildLogs() string {
-	return stripColor(a.buildLogs.String())
+	return utils.StripColor(a.buildLogs.String())
 }
 
 func (a *App) SetHealthCheck(command, interval, timeout string) {
@@ -354,7 +380,7 @@ func (a *App) Logs() (string, error) {
 		return "", err
 	}
 
-	return stripColor(string(output)), nil
+	return utils.StripColor(string(output)), nil
 }
 
 func (a *App) HTTPGet(path string) (string, map[string][]string, error) {
@@ -378,13 +404,6 @@ func (a *App) HTTPGet(path string) (string, map[string][]string, error) {
 func (a *App) HTTPGetBody(path string) (string, error) {
 	resp, _, err := a.HTTPGet(path)
 	return resp, err
-}
-
-func stripColor(input string) string {
-	const ansi = "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
-
-	var re = regexp.MustCompile(ansi)
-	return re.ReplaceAllString(input, "")
 }
 
 func getCacheVolumes() ([]string, error) {
@@ -411,4 +430,17 @@ func randomString(n int) string {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
 	}
 	return string(b)
+}
+
+func GetApiEndpoint(buildpackName string) string {
+	return fmt.Sprintf("https://api.github.com/repos/cloudfoundry/%s/releases/latest", buildpackName)
+}
+
+func GetDownloadUri(response utils.ReleaseResponse, asset int) (string, string, error) {
+	if len(response.Assets) < asset {
+		fmt.Printf("release asset %v", response)
+		return "", "", fmt.Errorf("there is no corresponding no release asset at index %v", asset)
+	}
+
+	return response.Assets[asset].BrowserDownloadURL, response.TagName, nil
 }
